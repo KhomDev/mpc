@@ -12,8 +12,8 @@ use crate::protocol::{Action, Protocol};
 // All participants share a single global timeline starting at t=0.
 // Each participant tracks its position on this timeline via a clock (in ns).
 // The clock advances in two ways:
-//   - Computation: wall-clock time of each productive poke() call is added
-//     (Send/Return actions only, not Wait).
+//   - Computation: wall-clock time of each poke() call is added, including
+//     pokes that end in Wait, which may have processed received messages.
 //   - Waiting: on message receipt, clock = max(clock, arrival_time).
 // Messages are delivered via a priority queue ordered by arrival_time,
 // where arrival_time = sender_clock + latency at the time of sending.
@@ -47,6 +47,12 @@ pub fn run_simulation<T>(
         total_messages_received: 0,
         bytes_sent_per_participant: all_participants.iter().map(|p| (*p, 0)).collect(),
         bytes_received_per_participant: all_participants.iter().map(|p| (*p, 0)).collect(),
+        compute_time_per_participant: all_participants
+            .iter()
+            .map(|p| (*p, Duration::ZERO))
+            .collect(),
+        max_burst_time: Duration::ZERO,
+        max_message_bytes: 0,
         virtual_time_elapsed: 0,
     };
 
@@ -80,14 +86,7 @@ pub fn run_simulation<T>(
             state.clock = msg.arrival_time;
         }
 
-        let data_len = msg.data.len() as u64;
-        metrics.total_bytes_received += data_len;
-        metrics.total_messages_received += 1;
-        *metrics
-            .bytes_received_per_participant
-            .entry(msg.to)
-            .or_insert(0) += data_len;
-
+        metrics.record_received(msg.to, &msg.data);
         protocols[receiver_idx]
             .1
             .message(msg.from, msg.data)
@@ -170,6 +169,13 @@ pub struct SimulationMetrics {
     pub total_messages_received: u64,
     pub bytes_sent_per_participant: HashMap<Participant, u64>,
     pub bytes_received_per_participant: HashMap<Participant, u64>,
+    /// Wall-clock time each participant spent in `poke()`, `Wait` pokes included.
+    pub compute_time_per_participant: HashMap<Participant, Duration>,
+    /// Longest run of consecutive `poke()` calls up to a `Wait`, `Yield` or `Return`: how long
+    /// the node's protocol runner holds a runtime thread without yielding to other tasks.
+    pub max_burst_time: Duration,
+    /// Largest single protocol message, in bytes.
+    pub max_message_bytes: u64,
     /// max(all participant clocks) in ns, includes network latency + computation time.
     pub virtual_time_elapsed: u64,
 }
@@ -178,6 +184,31 @@ impl SimulationMetrics {
     #[allow(clippy::cast_precision_loss)]
     pub fn virtual_time_ms(&self) -> f64 {
         self.virtual_time_elapsed as f64 / 1_000_000.0
+    }
+
+    fn record_sent(&mut self, sender: Participant, data: &[u8]) {
+        let data_len = u64::try_from(data.len()).expect("message length fits in u64");
+        self.total_bytes_sent += data_len;
+        self.total_messages_sent += 1;
+        self.max_message_bytes = self.max_message_bytes.max(data_len);
+        *self.bytes_sent_per_participant.entry(sender).or_insert(0) += data_len;
+    }
+
+    fn record_received(&mut self, receiver: Participant, data: &[u8]) {
+        let data_len = u64::try_from(data.len()).expect("message length fits in u64");
+        self.total_bytes_received += data_len;
+        self.total_messages_received += 1;
+        *self
+            .bytes_received_per_participant
+            .entry(receiver)
+            .or_insert(0) += data_len;
+    }
+
+    pub fn avg_compute_time(&self) -> Duration {
+        let total: Duration = self.compute_time_per_participant.values().sum();
+        let participants = u32::try_from(self.compute_time_per_participant.len().max(1))
+            .expect("participant count fits in u32");
+        total / participants
     }
 
     /// Assert that sent counts match between runs. Received counts are not
@@ -220,6 +251,13 @@ impl std::fmt::Display for SimulationMetrics {
             "Avg bytes/participant: {:.0} sent, {:.0} received",
             self.total_bytes_sent as f64 / n,
             self.total_bytes_received as f64 / n
+        )?;
+        writeln!(
+            f,
+            "Avg compute/participant: {:.3} ms, max burst: {:.3} ms, max message: {} bytes",
+            self.avg_compute_time().as_secs_f64() * 1e3,
+            self.max_burst_time.as_secs_f64() * 1e3,
+            self.max_message_bytes
         )?;
         Ok(())
     }
@@ -313,67 +351,62 @@ fn drain_poke<T>(
     }
 
     let sender = protocols[idx].0;
+    let mut burst = Duration::ZERO;
 
     loop {
         let poke_start = Instant::now();
         let action = protocols[idx].1.poke().expect("Protocol poke failed");
-        let poke_elapsed_ns = poke_start.elapsed().as_nanos() as u64;
+        let poke_elapsed = poke_start.elapsed();
+        states[idx].clock +=
+            u64::try_from(poke_elapsed.as_nanos()).expect("a poke takes less than 584 years");
+        burst += poke_elapsed;
+        *metrics
+            .compute_time_per_participant
+            .entry(sender)
+            .or_default() += poke_elapsed;
 
-        match action {
-            Action::Wait => break,
-            // Keep poking; yields still count toward the participant's clock.
-            Action::Yield => {
-                states[idx].clock += poke_elapsed_ns;
-            }
+        let keep_poking = match action {
+            Action::Wait => false,
+            Action::Yield => true,
             Action::SendMany(data) => {
-                states[idx].clock += poke_elapsed_ns;
                 for &recipient in all_participants {
                     if recipient == sender {
                         continue;
                     }
-                    let data_len = data.len() as u64;
-                    metrics.total_bytes_sent += data_len;
-                    metrics.total_messages_sent += 1;
-                    *metrics
-                        .bytes_sent_per_participant
-                        .entry(sender)
-                        .or_insert(0) += data_len;
-
-                    let latency = latency_model.sample();
+                    metrics.record_sent(sender, &data);
                     queue.push(Reverse(PendingMessage {
-                        arrival_time: states[idx].clock + latency,
+                        arrival_time: states[idx].clock + latency_model.sample(),
                         from: sender,
                         to: recipient,
                         data: data.clone(),
                     }));
                 }
+                continue;
             }
             Action::SendPrivate(recipient, data) => {
-                states[idx].clock += poke_elapsed_ns;
                 if indices.contains_key(&recipient) {
-                    let data_len = data.len() as u64;
-                    metrics.total_bytes_sent += data_len;
-                    metrics.total_messages_sent += 1;
-                    *metrics
-                        .bytes_sent_per_participant
-                        .entry(sender)
-                        .or_insert(0) += data_len;
-
-                    let latency = latency_model.sample();
+                    metrics.record_sent(sender, &data);
                     queue.push(Reverse(PendingMessage {
-                        arrival_time: states[idx].clock + latency,
+                        arrival_time: states[idx].clock + latency_model.sample(),
                         from: sender,
                         to: recipient,
                         data,
                     }));
                 }
+                continue;
             }
             Action::Return(result) => {
-                states[idx].clock += poke_elapsed_ns;
                 states[idx].finished = true;
                 outputs.push((sender, result));
-                break;
+                false
             }
+        };
+
+        metrics.max_burst_time = metrics.max_burst_time.max(burst);
+        burst = Duration::ZERO;
+
+        if !keep_poking {
+            break;
         }
     }
 }
