@@ -420,8 +420,8 @@ impl MeshNetworkClient {
         networking_metrics::NETWORK_LIVE_CONNECTIONS.reset();
 
         for id in self.all_participant_ids() {
-            let metric = networking_metrics::NETWORK_LIVE_CONNECTIONS
-                .with_label_values(&[&my_participant_id.to_string(), &id.to_string()]);
+            let metric =
+                networking_metrics::NETWORK_LIVE_CONNECTIONS.with_label_values(&[&id.to_string()]);
             if id == my_participant_id {
                 metric.set(1);
             } else {

@@ -16,8 +16,6 @@ pub(crate) const MPC_COMPUTATION_MESSAGE: &str = "mpc_computation";
 pub(crate) const MPC_ABORT_MESSAGE: &str = "mpc_abort";
 pub(crate) const MPC_SUCCESS_MESSAGE: &str = "mpc_success";
 
-// TODO(#1852): remove this label. Don't reuse for new metrics.
-const LABEL_MY_PARTICIPANT_ID: &str = "my_participant_id";
 const LABEL_PEER_PARTICIPANT_ID: &str = "peer_participant_id";
 const LABEL_CONNECTION_DIRECTION: &str = "connection_direction";
 const LABEL_MESSAGE_TYPE: &str = "message_type";
@@ -52,7 +50,7 @@ pub(crate) static NETWORK_LIVE_CONNECTIONS: LazyLock<IntGaugeVec> = LazyLock::ne
     register_int_gauge_vec!(
         "mpc_network_live_connections",
         "Current state of the mesh network connections",
-        &[LABEL_MY_PARTICIPANT_ID, LABEL_PEER_PARTICIPANT_ID],
+        &[LABEL_PEER_PARTICIPANT_ID],
     )
     .unwrap()
 });
@@ -79,3 +77,23 @@ pub(crate) static INCOMING_CONNECTIONS_REJECTED: LazyLock<IntCounterVec> = LazyL
     )
     .unwrap()
 });
+
+#[cfg(test)]
+mod tests {
+    use prometheus::core::Collector;
+
+    use super::NETWORK_LIVE_CONNECTIONS;
+
+    #[test]
+    fn network_live_connections__should_be_labelled_only_by_peer() {
+        // Given / When
+        let descs = NETWORK_LIVE_CONNECTIONS.desc();
+
+        // Then
+        assert_eq!(descs.len(), 1);
+        assert_eq!(
+            descs[0].variable_labels,
+            vec!["peer_participant_id".to_string()]
+        );
+    }
+}
