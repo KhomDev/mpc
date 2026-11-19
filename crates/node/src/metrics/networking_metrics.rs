@@ -85,6 +85,7 @@ mod tests {
     use super::NETWORK_LIVE_CONNECTIONS;
 
     #[test]
+    #[expect(non_snake_case)]
     fn network_live_connections__should_be_labelled_only_by_peer() {
         // Given / When
         let descs = NETWORK_LIVE_CONNECTIONS.desc();
