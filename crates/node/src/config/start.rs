@@ -237,12 +237,20 @@ fn refresh_boot_nodes(config_path: &Path, near_init: &NearInitConfig) -> anyhow:
 
 /// Sets `network.boot_nodes` when `near_init` provides a boot list. No-op when
 /// unset. Returns whether the config was changed.
-// Red-commit stub: the real body lands in the next commit.
 fn set_boot_nodes(
-    _config: &mut serde_json::Value,
-    _near_init: &NearInitConfig,
+    config: &mut serde_json::Value,
+    near_init: &NearInitConfig,
 ) -> anyhow::Result<bool> {
-    Ok(false)
+    let Some(boot_nodes) = &near_init.boot_nodes else {
+        return Ok(false);
+    };
+    let boot_nodes = serde_json::Value::String(boot_nodes.clone());
+    let network = object_at(config, &["network"])?;
+    if network.get("boot_nodes") == Some(&boot_nodes) {
+        return Ok(false);
+    }
+    network.insert("boot_nodes".to_owned(), boot_nodes);
+    Ok(true)
 }
 
 /// Sets the advertised `tier3_public_addr` when `near_init` provides one (it is
