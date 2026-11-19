@@ -599,14 +599,16 @@ fn assert_domain_key_in_running_state(state: &dtos::RunningContractState, domain
         .iter()
         .find(|key| key.domain_id == expected_config.id)
         .unwrap_or_else(|| panic!("no key is registered for domain {:?}", expected_config.id));
+    let registered_public_key = dtos::PublicKey::try_from(&registered_key.key)
+        .expect("registered key converts to a public key");
     let expected_public_key = dtos::PublicKey::from(domain_key.domain_public_key.clone());
     assert_eq!(
-        registered_key.key, expected_public_key,
+        registered_public_key, expected_public_key,
         "registered key for domain {:?} does not match the generated public key",
         expected_config.id
     );
 
-    let key_curve = match &registered_key.key {
+    let key_curve = match &registered_public_key {
         dtos::PublicKey::Secp256k1(_) => Curve::Secp256k1,
         dtos::PublicKey::Ed25519(_) => Curve::Edwards25519,
         dtos::PublicKey::Bls12381(_) => Curve::Bls12381,
